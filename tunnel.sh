@@ -10,7 +10,7 @@ IPSEC_CONN_FILE="/etc/ipsec.d/fou-tunnel.conf"
 IPSEC_SECRET_FILE="/etc/ipsec.d/fou-tunnel.secrets"
 IPSEC_MAIN_CONF="/etc/ipsec.conf"
 IPSEC_MAIN_SECRETS="/etc/ipsec.secrets"
-TCP_PORT=443
+TCP_PORTS="443"
 BBR_SCRIPT_URL="https://raw.githubusercontent.com/teddysun/across/ac11f0d4c51e82b9d6b119e19601232c63a62d2d/bbr.sh"
 BBR_SCRIPT_SHA256="17f447d78ba82468727e97cfdaa2a18150840a4c00c207592e5329df36544e85"
 TCP_SCRIPT_URL="https://raw.githubusercontent.com/chiakge/Linux-NetSpeed/351f4c53e5153c511de4e737ff54e35c73abb1a5/tcp.sh"
@@ -46,6 +46,42 @@ validate_psk() {
     (( ${#psk} >= 12 ))
 }
 
+validate_port() {
+    local port="$1"
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    (( port >= 1 && port <= 65535 ))
+}
+
+normalize_ports() {
+    local raw="$1"
+    local __var_name="$2"
+    local cleaned result port
+    local -a ports
+
+    cleaned="${raw// /}"
+    [ -n "$cleaned" ] || return 1
+
+    IFS=',' read -r -a ports <<< "$cleaned"
+    [ "${#ports[@]}" -gt 0 ] || return 1
+
+    result=""
+    for port in "${ports[@]}"; do
+        [ -n "$port" ] || return 1
+        validate_port "$port" || return 1
+        case ",$result," in
+            *",$port,"*) continue ;;
+        esac
+        if [ -z "$result" ]; then
+            result="$port"
+        else
+            result="$result,$port"
+        fi
+    done
+
+    [ -n "$result" ] || return 1
+    printf -v "$__var_name" '%s' "$result"
+}
+
 read_ipv4_value() {
     local prompt="$1"
     local __var_name="$2"
@@ -75,6 +111,19 @@ read_psk_value() {
     done
 }
 
+read_port_list_value() {
+    local value normalized
+
+    while true; do
+        read -r -p "Enter forwarding port(s) (e.g., 443 or 201,443): " value
+        if normalize_ports "$value" normalized; then
+            TCP_PORTS="$normalized"
+            return
+        fi
+        echo "Invalid ports. Use 1-65535, comma-separated."
+    done
+}
+
 save_config() {
     local psk_b64
     local old_umask
@@ -89,6 +138,7 @@ LOCAL_IP=$LOCAL_IP
 REMOTE_IP=$REMOTE_IP
 LOCAL_TUNNEL_IP=$LOCAL_TUNNEL_IP
 REMOTE_TUNNEL_IP=$REMOTE_TUNNEL_IP
+TCP_PORTS=$TCP_PORTS
 IPSEC_PSK_B64=$psk_b64
 EOC
 
@@ -106,6 +156,7 @@ load_config() {
     REMOTE_IP=""
     LOCAL_TUNNEL_IP=""
     REMOTE_TUNNEL_IP=""
+    TCP_PORTS="443"
     IPSEC_PSK=""
 
     while IFS= read -r line || [ -n "$line" ]; do
@@ -117,6 +168,7 @@ load_config() {
             REMOTE_IP) REMOTE_IP="$value" ;;
             LOCAL_TUNNEL_IP) LOCAL_TUNNEL_IP="$value" ;;
             REMOTE_TUNNEL_IP) REMOTE_TUNNEL_IP="$value" ;;
+            TCP_PORTS) TCP_PORTS="$value" ;;
             IPSEC_PSK_B64) psk_b64="$value" ;;
         esac
     done < "$CONFIG_FILE"
@@ -132,6 +184,7 @@ load_config() {
     validate_ipv4 "$REMOTE_IP" || return 1
     validate_ipv4 "$LOCAL_TUNNEL_IP" || return 1
     validate_ipv4 "$REMOTE_TUNNEL_IP" || return 1
+    normalize_ports "$TCP_PORTS" TCP_PORTS || return 1
     validate_psk "$IPSEC_PSK" || return 1
 
     return 0
@@ -300,6 +353,7 @@ LOCAL_IP="$LOCAL_IP"
 REMOTE_IP="$REMOTE_IP"
 LOCAL_TUNNEL_IP="$LOCAL_TUNNEL_IP"
 REMOTE_TUNNEL_IP="$REMOTE_TUNNEL_IP"
+TCP_PORTS="$TCP_PORTS"
 
 create_gre() {
     modprobe ip_gre
@@ -316,9 +370,48 @@ create_gre() {
     ip route replace "\${REMOTE_TUNNEL_IP}/32" dev gre1
 }
 
+run_socat() {
+    local -a ports pids
+    local port pid
+
+    IFS=',' read -r -a ports <<< "\$TCP_PORTS"
+    if [ "\${#ports[@]}" -eq 0 ]; then
+        echo "No forwarding ports configured."
+        exit 1
+    fi
+
+    stop_children() {
+        local child_pid
+        for child_pid in "\${pids[@]}"; do
+            kill "\$child_pid" >/dev/null 2>&1 || true
+        done
+        wait >/dev/null 2>&1 || true
+    }
+
+    trap 'stop_children; exit 0' TERM INT
+
+    for port in "\${ports[@]}"; do
+        socat "TCP-LISTEN:\${port},fork,reuseaddr" "TUN:gre1,up" &
+        pids+=("\$!")
+    done
+
+    while true; do
+        for pid in "\${pids[@]}"; do
+            if ! kill -0 "\$pid" >/dev/null 2>&1; then
+                stop_children
+                exit 1
+            fi
+        done
+        sleep 1
+    done
+}
+
 case "\${1:-}" in
     start-gre)
         create_gre
+        ;;
+    run-socat)
+        run_socat
         ;;
     stop-gre)
         if ip link show gre1 >/dev/null 2>&1; then
@@ -331,7 +424,7 @@ case "\${1:-}" in
         "\$0" start-gre
         ;;
     *)
-        echo "Usage: \$0 {start-gre|stop-gre|restart-gre}"
+        echo "Usage: \$0 {start-gre|run-socat|stop-gre|restart-gre}"
         exit 1
         ;;
 esac
@@ -341,10 +434,7 @@ EOR
 }
 
 configure_service() {
-    local socat_bin
-
-    socat_bin="$(command -v socat)"
-    if [ -z "$socat_bin" ]; then
+    if ! command -v socat >/dev/null 2>&1; then
         echo "socat binary not found."
         exit 1
     fi
@@ -358,7 +448,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStartPre=$RUNNER_FILE start-gre
-ExecStart=$socat_bin TCP-LISTEN:$TCP_PORT,fork,reuseaddr TUN:gre1,up
+ExecStart=$RUNNER_FILE run-socat
 ExecStopPost=$RUNNER_FILE stop-gre
 Restart=always
 RestartSec=2
@@ -377,6 +467,7 @@ prompt_for_config() {
     read_ipv4_value "Enter remote IP address: " REMOTE_IP
     read_ipv4_value "Enter local tunnel IP (e.g., 30.30.30.2): " LOCAL_TUNNEL_IP
     read_ipv4_value "Enter remote tunnel IP (e.g., 30.30.30.1): " REMOTE_TUNNEL_IP
+    read_port_list_value
     read_psk_value
 }
 
