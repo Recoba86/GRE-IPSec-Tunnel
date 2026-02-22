@@ -11,6 +11,8 @@ IPSEC_SECRET_FILE="/etc/ipsec.d/fou-tunnel.secrets"
 IPSEC_MAIN_CONF="/etc/ipsec.conf"
 IPSEC_MAIN_SECRETS="/etc/ipsec.secrets"
 TCP_PORTS="443"
+UDP_ENABLED="no"
+UDP_PORTS=""
 BBR_SCRIPT_URL="https://raw.githubusercontent.com/teddysun/across/ac11f0d4c51e82b9d6b119e19601232c63a62d2d/bbr.sh"
 BBR_SCRIPT_SHA256="17f447d78ba82468727e97cfdaa2a18150840a4c00c207592e5329df36544e85"
 TCP_SCRIPT_URL="https://raw.githubusercontent.com/chiakge/Linux-NetSpeed/351f4c53e5153c511de4e737ff54e35c73abb1a5/tcp.sh"
@@ -82,6 +84,20 @@ normalize_ports() {
     printf -v "$__var_name" '%s' "$result"
 }
 
+prompt_yes_no() {
+    local prompt="$1"
+    local answer
+
+    while true; do
+        read -r -p "$prompt" answer
+        case "$answer" in
+            y|Y|yes|YES) return 0 ;;
+            n|N|no|NO) return 1 ;;
+            *) echo "Please answer y or n." ;;
+        esac
+    done
+}
+
 read_ipv4_value() {
     local prompt="$1"
     local __var_name="$2"
@@ -112,12 +128,14 @@ read_psk_value() {
 }
 
 read_port_list_value() {
+    local prompt="$1"
+    local __var_name="$2"
     local value normalized
 
     while true; do
-        read -r -p "Enter forwarding port(s) (e.g., 443 or 201,443): " value
+        read -r -p "$prompt" value
         if normalize_ports "$value" normalized; then
-            TCP_PORTS="$normalized"
+            printf -v "$__var_name" '%s' "$normalized"
             return
         fi
         echo "Invalid ports. Use 1-65535, comma-separated."
@@ -139,6 +157,8 @@ REMOTE_IP=$REMOTE_IP
 LOCAL_TUNNEL_IP=$LOCAL_TUNNEL_IP
 REMOTE_TUNNEL_IP=$REMOTE_TUNNEL_IP
 TCP_PORTS=$TCP_PORTS
+UDP_ENABLED=$UDP_ENABLED
+UDP_PORTS=$UDP_PORTS
 IPSEC_PSK_B64=$psk_b64
 EOC
 
@@ -157,6 +177,8 @@ load_config() {
     LOCAL_TUNNEL_IP=""
     REMOTE_TUNNEL_IP=""
     TCP_PORTS="443"
+    UDP_ENABLED="no"
+    UDP_PORTS=""
     IPSEC_PSK=""
 
     while IFS= read -r line || [ -n "$line" ]; do
@@ -169,6 +191,8 @@ load_config() {
             LOCAL_TUNNEL_IP) LOCAL_TUNNEL_IP="$value" ;;
             REMOTE_TUNNEL_IP) REMOTE_TUNNEL_IP="$value" ;;
             TCP_PORTS) TCP_PORTS="$value" ;;
+            UDP_ENABLED) UDP_ENABLED="$value" ;;
+            UDP_PORTS) UDP_PORTS="$value" ;;
             IPSEC_PSK_B64) psk_b64="$value" ;;
         esac
     done < "$CONFIG_FILE"
@@ -185,6 +209,14 @@ load_config() {
     validate_ipv4 "$LOCAL_TUNNEL_IP" || return 1
     validate_ipv4 "$REMOTE_TUNNEL_IP" || return 1
     normalize_ports "$TCP_PORTS" TCP_PORTS || return 1
+    if [ "$UDP_ENABLED" != "yes" ] && [ "$UDP_ENABLED" != "no" ]; then
+        return 1
+    fi
+    if [ "$UDP_ENABLED" = "yes" ]; then
+        normalize_ports "$UDP_PORTS" UDP_PORTS || return 1
+    else
+        UDP_PORTS=""
+    fi
     validate_psk "$IPSEC_PSK" || return 1
 
     return 0
@@ -354,6 +386,8 @@ REMOTE_IP="$REMOTE_IP"
 LOCAL_TUNNEL_IP="$LOCAL_TUNNEL_IP"
 REMOTE_TUNNEL_IP="$REMOTE_TUNNEL_IP"
 TCP_PORTS="$TCP_PORTS"
+UDP_ENABLED="$UDP_ENABLED"
+UDP_PORTS="$UDP_PORTS"
 
 create_gre() {
     modprobe ip_gre
@@ -371,12 +405,12 @@ create_gre() {
 }
 
 run_socat() {
-    local -a ports pids
+    local -a tcp_ports udp_ports pids
     local port pid
 
-    IFS=',' read -r -a ports <<< "\$TCP_PORTS"
-    if [ "\${#ports[@]}" -eq 0 ]; then
-        echo "No forwarding ports configured."
+    IFS=',' read -r -a tcp_ports <<< "\$TCP_PORTS"
+    if [ "\${#tcp_ports[@]}" -eq 0 ]; then
+        echo "No TCP forwarding ports configured."
         exit 1
     fi
 
@@ -390,10 +424,18 @@ run_socat() {
 
     trap 'stop_children; exit 0' TERM INT
 
-    for port in "\${ports[@]}"; do
+    for port in "\${tcp_ports[@]}"; do
         socat "TCP-LISTEN:\${port},fork,reuseaddr" "TUN:gre1,up" &
         pids+=("\$!")
     done
+
+    if [ "\$UDP_ENABLED" = "yes" ]; then
+        IFS=',' read -r -a udp_ports <<< "\$UDP_PORTS"
+        for port in "\${udp_ports[@]}"; do
+            socat "UDP-LISTEN:\${port},fork,reuseaddr" "TUN:gre1,up" &
+            pids+=("\$!")
+        done
+    fi
 
     while true; do
         for pid in "\${pids[@]}"; do
@@ -467,7 +509,14 @@ prompt_for_config() {
     read_ipv4_value "Enter remote IP address: " REMOTE_IP
     read_ipv4_value "Enter local tunnel IP (e.g., 30.30.30.2): " LOCAL_TUNNEL_IP
     read_ipv4_value "Enter remote tunnel IP (e.g., 30.30.30.1): " REMOTE_TUNNEL_IP
-    read_port_list_value
+    read_port_list_value "Enter TCP forwarding port(s) (e.g., 443 or 201,443): " TCP_PORTS
+    if prompt_yes_no "Do you want UDP forwarding too? (y/n): "; then
+        UDP_ENABLED="yes"
+        read_port_list_value "Enter UDP forwarding port(s) (e.g., 1080 or 1080,5353): " UDP_PORTS
+    else
+        UDP_ENABLED="no"
+        UDP_PORTS=""
+    fi
     read_psk_value
 }
 
