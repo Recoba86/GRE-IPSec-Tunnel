@@ -198,11 +198,8 @@ install_scripts() {
     bbr_file="$temp_dir/bbr.sh"
     tcp_file="$temp_dir/tcp.sh"
 
-    echo "Downloading pinned bbr.sh and tcp.sh with SHA256 verification..."
     safe_download "$BBR_SCRIPT_URL" "$bbr_file" "$BBR_SCRIPT_SHA256"
     safe_download "$TCP_SCRIPT_URL" "$tcp_file" "$TCP_SCRIPT_SHA256"
-
-    echo "Download integrity checks passed."
 
     bash "$bbr_file"
     printf '10\n' | bash "$tcp_file"
@@ -409,8 +406,7 @@ configure_tunnel() {
     generate_runner_script
     configure_service
 
-    echo "Tunnel and IPSec configuration applied successfully."
-    echo "socat is now supervised directly by systemd."
+    echo "Configuration applied."
     pause_screen
 }
 
@@ -421,7 +417,6 @@ check_remote() {
         return
     fi
 
-    echo "Checking connection to $REMOTE_IP..."
     if ping -c 4 "$REMOTE_IP" >/dev/null 2>&1; then
         echo "Remote IP $REMOTE_IP is reachable."
     else
@@ -438,7 +433,6 @@ check_tunnel_status() {
         return
     fi
 
-    echo "Checking tunnel status to $REMOTE_TUNNEL_IP..."
     if ping -c 4 "$REMOTE_TUNNEL_IP" >/dev/null 2>&1; then
         echo "Tunnel endpoint $REMOTE_TUNNEL_IP is reachable."
     else
@@ -489,21 +483,14 @@ remove_tunnel() {
 
     rm -f "$CONFIG_FILE"
 
-    echo "Tunnel removed. Only tunnel-specific IPSec files were deleted."
+    echo "Tunnel removed."
     pause_screen
 }
 
 show_menu() {
     while true; do
         clear
-        cat <<'EOM'
- ____  ____  ____  ____  _  ____  ____  _
-/  _ \/  _ \/ ___\/ ___\/ \/  __\/  _ \/ \  /|
-| / \|| / \||    \|    \| ||  \/|| / \|| |\ ||
-| |-||| |-||\___ |\___ || ||    /| |-||| | \||
-\_/ \|\_/ \|\____/\____/\_/\_/\_\\_/ \|\_/  \|
-EOM
-        echo ""
+        echo "GRE over IPSec Tunnel"
         echo "1. Configure Tunnel"
         echo "2. Check Remote Connection"
         echo "3. Install bbr.sh and tcp.sh"
@@ -519,10 +506,7 @@ EOM
             4) check_tunnel_status ;;
             5) remove_tunnel ;;
             6) exit 0 ;;
-            *)
-                echo "Invalid option."
-                sleep 1
-                ;;
+            *) sleep 1 ;;
         esac
     done
 }
